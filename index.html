@@ -1423,16 +1423,30 @@
     document.getElementById('loginPass').value = '';
   }
 
+  function deriveNameFromEmail(email){
+    var local = String(email).split('@')[0] || 'Investigator';
+    var words = local.replace(/[._-]+/g, ' ').trim().split(/\s+/).filter(Boolean);
+    if(!words.length) return 'Investigator';
+    return words.map(function(w){ return w.charAt(0).toUpperCase() + w.slice(1); }).join(' ');
+  }
+
   loginBtn.addEventListener('click', function(){
     var email = document.getElementById('loginEmail').value.trim();
     var pass = document.getElementById('loginPass').value;
     if(!email || !pass){ loginError.classList.add('show'); return; }
     loginError.classList.remove('show');
     try{ sessionStorage.setItem(SESSION_KEY, JSON.stringify({ email:email, ts:Date.now() })); }catch(e){}
+    profile.name = deriveNameFromEmail(email);
+    profile.email = email;
+    saveJSON(PROFILE_KEY, profile);
     enterApp();
   });
   guestBtn.addEventListener('click', function(){
-    try{ sessionStorage.setItem(SESSION_KEY, JSON.stringify({ email:'guest@forensight.demo', ts:Date.now() })); }catch(e){}
+    var email = 'guest@forensight.demo';
+    try{ sessionStorage.setItem(SESSION_KEY, JSON.stringify({ email:email, ts:Date.now() })); }catch(e){}
+    profile.name = 'Guest Investigator';
+    profile.email = email;
+    saveJSON(PROFILE_KEY, profile);
     enterApp();
   });
   document.getElementById('signOutBtn').addEventListener('click', function(e){ e.stopPropagation(); signOut(); });
