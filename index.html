@@ -69,7 +69,8 @@ def decode_image(data: bytes) -> np.ndarray:
         raise ValueError("Unsupported or corrupt image.")
     return bgr
 
-def phash_from_bgr(bgr: np.ndarray) -> str:
+def phash_from_face(bgr: np.ndarray) -> str:
+    """Perceptual hash for a FACE CROP only. Never hashes the full scene."""
     rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
     return str(imagehash.phash(Image.fromarray(rgb)))
 
@@ -111,7 +112,8 @@ def crop_faces(bgr: np.ndarray, faces: List[Dict[str, int]], pad=0.20):
     return out
 
 @torch.no_grad()
-def embedding(bgr: np.ndarray) -> np.ndarray:
+def face_embedding(bgr: np.ndarray) -> np.ndarray:
+    """Create an embedding from a FACE CROP only."""
     rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
     tensor = PREPROCESS(Image.fromarray(rgb)).unsqueeze(0).to(DEVICE)
     vec = EMBED_MODEL(tensor).squeeze(0)
@@ -185,17 +187,25 @@ def masked_full_heatmap(bgr, face_boxes):
     return full * mask
 
 def analyze(data: bytes) -> Dict[str, Any]:
+    """
+    IMPORTANT SCOPE RULE:
+    1) The full image is decoded ONLY to locate human faces and preserve the original SHA-256.
+    2) All forensic analysis (CNN, ELA, pHash, embedding, heatmap) runs ONLY on detected face crops.
+    3) A non-face image is rejected from forensic processing; no scene-level CNN/embedding is run.
+    """
     bgr = decode_image(data)
     faces = detect_faces(bgr)
 
     result = {
         "scope": "human-face morph detection only",
+        "analysis_scope": "face-crops-only",
         "face_count": len(faces),
         "model_loaded": MODEL is not None,
-        "sha256": sha256_bytes(data),
-        "phash": phash_from_bgr(bgr),
-        "embedding": None,
-        "faces": faces,
+        "sha256": sha256_bytes(data),  # Evidence integrity only; NOT used for detection.
+        "phash": None,                # Face-only pHash is stored per face below.
+        "embedding": None,            # Face-only embedding is stored per face below.
+        "embedding_model": "ResNet18-face-crop",
+        "faces": [],
     }
 
     if not faces:
@@ -204,43 +214,82 @@ def analyze(data: bytes) -> Dict[str, Any]:
             "verdict": "review",
             "confidence": 0,
             "forgery_type": "No human face detected",
-            "message": "This pipeline only analyzes human-face morph/manipulation. No detectable face was found.",
+            "message": "Rejected for human-morph analysis: no detectable human face was found.",
+            "heatmap": None,
             "breakdown": [
-                {"key":"face", "title":"Human Face Detection", "status":"flagged",
-                 "summary":"No detectable human face", "detail":"The human-morph pipeline does not analyze non-face regions."},
-                {"key":"hash", "title":"Cryptographic Hash", "status":"pass",
-                 "summary":"SHA-256 calculated from uploaded bytes", "detail":result["sha256"]},
+                {"key":"face", "title":"Human Face Detection", "status":"reviewed",
+                 "summary":"No detectable human face",
+                 "detail":"Only face regions are supported. The full scene is not passed to the morph CNN, ELA, pHash, or embedding model."},
+                {"key":"hash", "title":"Evidence Hash", "status":"pass",
+                 "summary":"SHA-256 calculated from uploaded bytes for chain of custody only",
+                 "detail":result["sha256"]},
             ],
         })
         return result
 
-    # Global image embedding is deterministic and normalized; face embeddings are also available.
-    emb = embedding(bgr)
-    result["embedding"] = emb.tolist()
-    face_results = []
+    face_items = []
     scores = []
+    all_embeddings = []
+    all_phashes = []
+
     for idx, (x1, y1, x2, y2, crop) in enumerate(crop_faces(bgr, faces), 1):
-        item = {"index": idx, "box": {"x":x1,"y":y1,"w":x2-x1,"h":y2-y1}}
+        if crop.size == 0:
+            continue
+
+        item = {
+            "index": idx,
+            "box": {"x":x1,"y":y1,"w":x2-x1,"h":y2-y1},
+            "phash": phash_from_face(crop),
+            "embedding": None,
+            "embedding_model": "ResNet18-face-crop",
+        }
+        all_phashes.append(item["phash"])
+
+        # CNN is strictly face-crop-only.
         if MODEL is None:
             item.update({"probability": None, "label": "model unavailable"})
         else:
             with torch.no_grad():
                 x = PREPROCESS(Image.fromarray(cv2.cvtColor(crop, cv2.COLOR_BGR2RGB))).unsqueeze(0).to(DEVICE)
                 prob = torch.softmax(MODEL(x), dim=1)[0,1].item()
-            item.update({"probability": round(prob, 6),
-                         "label": "morphed" if prob >= 0.5 else "real"})
+            item.update({
+                "probability": round(prob, 6),
+                "label": "morphed" if prob >= 0.5 else "real",
+            })
             scores.append(prob)
-        face_results.append(item)
 
-    heat = masked_full_heatmap(bgr, faces)
+        # Embedding is strictly face-crop-only.
+        emb = face_embedding(crop)
+        item["embedding"] = emb.tolist()
+        all_embeddings.append(emb)
+        face_items.append(item)
+
+    if not face_items:
+        result.update({
+            "supported": False,
+            "verdict": "review",
+            "confidence": 0,
+            "forgery_type": "No usable face crop",
+            "message": "No usable human-face crop could be extracted for analysis.",
+            "heatmap": None,
+        })
+        return result
+
+    result["faces"] = face_items
+    result["face_count"] = len(face_items)
+    # For compatibility with the existing dashboard, expose the first face vector/hash.
+    # Matching code should use result['faces'][i]['embedding'] for multi-face cases.
+    result["embedding"] = face_items[0]["embedding"]
+    result["phash"] = face_items[0]["phash"]
+
+    # Face-only ELA + Grad-CAM. The rest of the scene remains zeroed in the output heatmap.
+    heat = masked_full_heatmap(bgr, [{"x":f["box"]["x"], "y":f["box"]["y"], "w":f["box"]["w"], "h":f["box"]["h"]} for f in faces])
     result["heatmap"] = colorize_heatmap(heat, bgr=bgr)
-    result["faces"] = face_results
 
     if MODEL is None:
         verdict, confidence, ftype = "review", 0, "Human face detected — CNN model not loaded"
     else:
         max_p = max(scores) if scores else 0.0
-        # Conservative thresholds: high probability is flagged; middle stays review.
         if max_p >= 0.80:
             verdict, confidence, ftype = "flagged", round(max_p*100), "Face morph / facial manipulation"
         elif max_p >= 0.50:
@@ -255,20 +304,20 @@ def analyze(data: bytes) -> Dict[str, Any]:
         "forgery_type": ftype,
         "breakdown": [
             {"key":"face", "title":"Human Face Detection", "status":"pass",
-             "summary":f"{len(faces)} face(s) isolated for analysis",
-             "detail":"Only detected human-face regions are passed to the morph detector."},
+             "summary":f"{len(face_items)} face crop(s) isolated for analysis",
+             "detail":"Only the detected face crops are passed to CNN, ELA, pHash, embedding, and heatmap generation."},
             {"key":"cnn", "title":"CNN Morph Detection", "status":"flagged" if verdict=="flagged" else ("reviewed" if verdict=="review" else "pass"),
-             "summary":"Face-level morph probability calculated by the configured CNN.",
-             "detail":"The CNN is evaluated independently on each detected face; the maximum face probability drives the case status."},
+             "summary":"Face-level morph probability calculated from face crops only.",
+             "detail":"The full photo is never sent to the morph CNN."},
             {"key":"ela", "title":"Error Level Analysis", "status":"reviewed",
              "summary":"ELA fused into the face-only heatmap.",
-             "detail":"JPEG recompression error is normalized robustly and masked to human-face regions."},
+             "detail":"ELA is calculated separately on each face crop; non-face pixels are masked out of the result."},
             {"key":"hash", "title":"Evidence Hashing", "status":"pass",
-             "summary":"SHA-256 and perceptual hash calculated from the original upload.",
-             "detail":f"SHA-256: {result['sha256']} · pHash: {result['phash']}"},
-            {"key":"embedding", "title":"Normalized Image Embedding", "status":"pass",
-             "summary":"512-dimensional L2-normalized ResNet embedding generated.",
-             "detail":"Cosine similarity can be computed directly because the stored vector is L2 normalized."},
+             "summary":"SHA-256 preserves the exact uploaded evidence; pHash is face-crop-only.",
+             "detail":f"SHA-256 (file integrity): {result['sha256']} · Face pHash (first face): {result['phash']}"},
+            {"key":"embedding", "title":"Face-Crop Embedding", "status":"pass",
+             "summary":"L2-normalized embedding generated independently for each face crop.",
+             "detail":"No whole-image embedding is generated or used for face similarity."},
         ],
     })
     return result
@@ -1003,7 +1052,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
         <div class="hero-left">
           <div class="breadcrumb">INVESTIGATIONS <span class="sep">/</span> <span class="cur">SIMILAR MATCHES</span></div>
           <h1 style="font-size:clamp(1.5rem,2.4vw,2.1rem);">Similar <em>Matches</em></h1>
-          <p class="lede">Visually similar images found across public sources, by perceptual hash and embedding similarity.</p>
+          <p class="lede">Visually similar FACE references found in the local index, using face-crop pHash and embeddings.</p>
         </div>
       </div>
       <div class="card">
@@ -1017,7 +1066,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
         <div style="color:var(--text-muted); font-size:0.9rem;" id="matchLoadingLabel">Searching public sources…</div>
       </div>
       <div class="card" id="matchResults">
-        <div class="card-desc">Live local reference index using normalized embeddings and perceptual hashing. No source is invented when the index has no match.</div>
+        <div class="card-desc">Live local reference index using FACE-CROP embeddings and perceptual hashing. No whole-photo similarity is used.</div>
         <div class="match-grid" id="matchGrid"></div>
       </div>
     </section>
@@ -1601,7 +1650,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   var progressWrap = document.getElementById('progressWrap');
   var progressFill = document.getElementById('progressFill');
   var progressLabel = document.getElementById('progressLabel');
-  var progressSteps = [[12,'Uploading exact evidence bytes…'],[28,'Detecting human face regions…'],[48,'Running face morph CNN…'],[66,'Computing ELA + Grad-CAM heatmap…'],[82,'Computing SHA-256, pHash and embedding…'],[94,'Searching local reference index…'],[100,'Saving chain-of-custody record…']];
+  var progressSteps = [[12,'Uploading exact evidence bytes…'],[28,'Detecting human face regions…'],[48,'Running face morph CNN…'],[66,'Computing face-only ELA + Grad-CAM heatmap…'],[82,'Computing file SHA-256 + face-only pHash/embedding…'],[94,'Searching local reference index…'],[100,'Saving chain-of-custody record…']];
 
   startBtn.addEventListener('click', async function(){
     if(!pendingFile) return;
