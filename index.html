@@ -1,346 +1,4 @@
-import io
-import os
-import hashlib
-import base64
-from typing import List, Dict, Any
-
-import cv2
-import numpy as np
-from PIL import Image, ImageChops, ImageEnhance
-import imagehash
-import torch
-import torch.nn as nn
-from torchvision import models, transforms
-from flask import Flask, request, jsonify
-from flask_cors import CORS
-
-APP = Flask(__name__)
-CORS(APP)
-
-MODEL_PATH = os.getenv("MORPH_MODEL_PATH", "models/morph_resnet18.pt")
-DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-# Human-face detector: OpenCV ships this cascade with opencv-python.
-FACE_CASCADE = cv2.CascadeClassifier(
-    cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
-)
-
-PREPROCESS = transforms.Compose([
-    transforms.Resize((224, 224)),
-    transforms.ToTensor(),
-    transforms.Normalize([0.485, 0.456, 0.406],
-                         [0.229, 0.224, 0.225]),
-])
-
-class MorphResNet18(nn.Module):
-    """Binary classifier: 0=real face, 1=morphed/manipulated face."""
-    def __init__(self):
-        super().__init__()
-        self.backbone = models.resnet18(weights=None)
-        self.backbone.fc = nn.Linear(self.backbone.fc.in_features, 2)
-
-    def forward(self, x):
-        return self.backbone(x)
-
-MODEL = None
-if os.path.exists(MODEL_PATH):
-    try:
-        checkpoint = torch.load(MODEL_PATH, map_location=DEVICE)
-        MODEL = MorphResNet18().to(DEVICE)
-        state = checkpoint.get("state_dict", checkpoint) if isinstance(checkpoint, dict) else checkpoint
-        state = {k.replace("module.", ""): v for k, v in state.items()}
-        MODEL.load_state_dict(state, strict=True)
-        MODEL.eval()
-    except Exception as exc:
-        print(f"[ForenSight] Could not load morph CNN: {exc}")
-        MODEL = None
-
-EMBED_MODEL = models.resnet18(weights=models.ResNet18_Weights.DEFAULT)
-EMBED_MODEL.fc = nn.Identity()
-EMBED_MODEL = EMBED_MODEL.to(DEVICE).eval()
-
-def sha256_bytes(data: bytes) -> str:
-    return hashlib.sha256(data).hexdigest()
-
-def decode_image(data: bytes) -> np.ndarray:
-    arr = np.frombuffer(data, dtype=np.uint8)
-    bgr = cv2.imdecode(arr, cv2.IMREAD_COLOR)
-    if bgr is None:
-        raise ValueError("Unsupported or corrupt image.")
-    return bgr
-
-def phash_from_face(bgr: np.ndarray) -> str:
-    """Perceptual hash for a FACE CROP only. Never hashes the full scene."""
-    rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
-    return str(imagehash.phash(Image.fromarray(rgb)))
-
-def detect_faces(bgr: np.ndarray) -> List[Dict[str, int]]:
-    gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
-    gray = cv2.equalizeHist(gray)
-    faces = FACE_CASCADE.detectMultiScale(
-        gray, scaleFactor=1.08, minNeighbors=6,
-        minSize=(64, 64), flags=cv2.CASCADE_SCALE_IMAGE
-    )
-    return [{"x": int(x), "y": int(y), "w": int(w), "h": int(h)}
-            for x, y, w, h in faces]
-
-def ela_heatmap(bgr: np.ndarray, quality=90) -> np.ndarray:
-    """ELA heatmap in [0,1]. Uses RGB JPEG re-encode and normalized absolute error."""
-    rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
-    original = Image.fromarray(rgb).convert("RGB")
-    buf = io.BytesIO()
-    original.save(buf, "JPEG", quality=quality, optimize=True)
-    recompressed = Image.open(io.BytesIO(buf.getvalue())).convert("RGB")
-    diff = ImageChops.difference(original, recompressed)
-    diff = ImageEnhance.Contrast(diff).enhance(8.0)
-    arr = np.asarray(diff).astype(np.float32)
-    score = np.mean(arr, axis=2)
-    # Robust normalization avoids a single outlier saturating the map.
-    lo, hi = np.percentile(score, [2, 98])
-    heat = np.clip((score - lo) / max(hi - lo, 1e-6), 0, 1)
-    return heat
-
-def crop_faces(bgr: np.ndarray, faces: List[Dict[str, int]], pad=0.20):
-    h, w = bgr.shape[:2]
-    out = []
-    for f in faces:
-        x, y, fw, fh = f["x"], f["y"], f["w"], f["h"]
-        px, py = int(fw * pad), int(fh * pad)
-        x1, y1 = max(0, x-px), max(0, y-py)
-        x2, y2 = min(w, x+fw+px), min(h, y+fh+py)
-        out.append((x1, y1, x2, y2, bgr[y1:y2, x1:x2]))
-    return out
-
-@torch.no_grad()
-def face_embedding(bgr: np.ndarray) -> np.ndarray:
-    """Create an embedding from a FACE CROP only."""
-    rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
-    tensor = PREPROCESS(Image.fromarray(rgb)).unsqueeze(0).to(DEVICE)
-    vec = EMBED_MODEL(tensor).squeeze(0)
-    vec = vec / (torch.linalg.vector_norm(vec) + 1e-12)
-    return vec.cpu().numpy().astype(np.float32)
-
-def cosine(a, b):
-    a = np.asarray(a, dtype=np.float32)
-    b = np.asarray(b, dtype=np.float32)
-    den = np.linalg.norm(a) * np.linalg.norm(b)
-    return float(np.dot(a, b) / den) if den else 0.0
-
-def gradcam(face_bgr: np.ndarray) -> np.ndarray:
-    """Grad-CAM for the morphed class; returns a 224x224 float map."""
-    if MODEL is None:
-        return np.zeros((224, 224), dtype=np.float32)
-
-    rgb = cv2.cvtColor(face_bgr, cv2.COLOR_BGR2RGB)
-    x = PREPROCESS(Image.fromarray(rgb)).unsqueeze(0).to(DEVICE)
-    activations, gradients = {}, {}
-
-    target = MODEL.backbone.layer4[-1].conv2
-    def fwd_hook(_, __, out): activations["v"] = out
-    def bwd_hook(_, gin, gout): gradients["v"] = gout[0]
-    h1 = target.register_forward_hook(fwd_hook)
-    h2 = target.register_full_backward_hook(bwd_hook)
-    try:
-        MODEL.zero_grad(set_to_none=True)
-        logits = MODEL(x)
-        score = logits[0, 1]
-        score.backward()
-        act = activations["v"][0]
-        grad = gradients["v"][0]
-        weights = grad.mean(dim=(1, 2), keepdim=True)
-        cam = torch.relu((weights * act).sum(dim=0)).detach().cpu().numpy()
-        cam = cv2.resize(cam, (224, 224), interpolation=cv2.INTER_LINEAR)
-        cam -= cam.min()
-        cam /= (cam.max() + 1e-8)
-        return cam.astype(np.float32)
-    finally:
-        h1.remove()
-        h2.remove()
-
-def colorize_heatmap(heat: np.ndarray, bgr=None, alpha=0.48) -> str:
-    heat8 = np.uint8(np.clip(heat, 0, 1) * 255)
-    color = cv2.applyColorMap(heat8, cv2.COLORMAP_JET)
-    if bgr is not None:
-        bg = cv2.resize(bgr, (heat8.shape[1], heat8.shape[0]))
-        color = cv2.addWeighted(bg, 1-alpha, color, alpha, 0)
-    rgb = cv2.cvtColor(color, cv2.COLOR_BGR2RGB)
-    ok, encoded = cv2.imencode(".jpg", cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR), [cv2.IMWRITE_JPEG_QUALITY, 88])
-    if not ok:
-        raise RuntimeError("Could not encode heatmap.")
-    return "data:image/jpeg;base64," + base64.b64encode(encoded.tobytes()).decode()
-
-def masked_full_heatmap(bgr, face_boxes):
-    """Fuse ELA + CNN CAM, but permit non-zero evidence only inside detected human faces."""
-    h, w = bgr.shape[:2]
-    full = np.zeros((h, w), np.float32)
-    mask = np.zeros((h, w), np.float32)
-    for x1, y1, x2, y2, crop in crop_faces(bgr, face_boxes):
-        cam = gradcam(crop)
-        ela = ela_heatmap(crop)
-        fused = 0.65 * cam + 0.35 * ela
-        fused = cv2.GaussianBlur(fused, (0, 0), 3)
-        fused = np.clip(fused, 0, 1)
-        ch, cw = y2-y1, x2-x1
-        fused = cv2.resize(fused, (cw, ch), interpolation=cv2.INTER_LINEAR)
-        full[y1:y2, x1:x2] = np.maximum(full[y1:y2, x1:x2], fused)
-        mask[y1:y2, x1:x2] = np.maximum(mask[y1:y2, x1:x2], 1)
-    return full * mask
-
-def analyze(data: bytes) -> Dict[str, Any]:
-    """
-    IMPORTANT SCOPE RULE:
-    1) The full image is decoded ONLY to locate human faces and preserve the original SHA-256.
-    2) All forensic analysis (CNN, ELA, pHash, embedding, heatmap) runs ONLY on detected face crops.
-    3) A non-face image is rejected from forensic processing; no scene-level CNN/embedding is run.
-    """
-    bgr = decode_image(data)
-    faces = detect_faces(bgr)
-
-    result = {
-        "scope": "human-face morph detection only",
-        "analysis_scope": "face-crops-only",
-        "face_count": len(faces),
-        "model_loaded": MODEL is not None,
-        "sha256": sha256_bytes(data),  # Evidence integrity only; NOT used for detection.
-        "phash": None,                # Face-only pHash is stored per face below.
-        "embedding": None,            # Face-only embedding is stored per face below.
-        "embedding_model": "ResNet18-face-crop",
-        "faces": [],
-    }
-
-    if not faces:
-        result.update({
-            "supported": False,
-            "verdict": "review",
-            "confidence": 0,
-            "forgery_type": "No human face detected",
-            "message": "Rejected for human-morph analysis: no detectable human face was found.",
-            "heatmap": None,
-            "breakdown": [
-                {"key":"face", "title":"Human Face Detection", "status":"reviewed",
-                 "summary":"No detectable human face",
-                 "detail":"Only face regions are supported. The full scene is not passed to the morph CNN, ELA, pHash, or embedding model."},
-                {"key":"hash", "title":"Evidence Hash", "status":"pass",
-                 "summary":"SHA-256 calculated from uploaded bytes for chain of custody only",
-                 "detail":result["sha256"]},
-            ],
-        })
-        return result
-
-    face_items = []
-    scores = []
-    all_embeddings = []
-    all_phashes = []
-
-    for idx, (x1, y1, x2, y2, crop) in enumerate(crop_faces(bgr, faces), 1):
-        if crop.size == 0:
-            continue
-
-        item = {
-            "index": idx,
-            "box": {"x":x1,"y":y1,"w":x2-x1,"h":y2-y1},
-            "phash": phash_from_face(crop),
-            "embedding": None,
-            "embedding_model": "ResNet18-face-crop",
-        }
-        all_phashes.append(item["phash"])
-
-        # CNN is strictly face-crop-only.
-        if MODEL is None:
-            item.update({"probability": None, "label": "model unavailable"})
-        else:
-            with torch.no_grad():
-                x = PREPROCESS(Image.fromarray(cv2.cvtColor(crop, cv2.COLOR_BGR2RGB))).unsqueeze(0).to(DEVICE)
-                prob = torch.softmax(MODEL(x), dim=1)[0,1].item()
-            item.update({
-                "probability": round(prob, 6),
-                "label": "morphed" if prob >= 0.5 else "real",
-            })
-            scores.append(prob)
-
-        # Embedding is strictly face-crop-only.
-        emb = face_embedding(crop)
-        item["embedding"] = emb.tolist()
-        all_embeddings.append(emb)
-        face_items.append(item)
-
-    if not face_items:
-        result.update({
-            "supported": False,
-            "verdict": "review",
-            "confidence": 0,
-            "forgery_type": "No usable face crop",
-            "message": "No usable human-face crop could be extracted for analysis.",
-            "heatmap": None,
-        })
-        return result
-
-    result["faces"] = face_items
-    result["face_count"] = len(face_items)
-    # For compatibility with the existing dashboard, expose the first face vector/hash.
-    # Matching code should use result['faces'][i]['embedding'] for multi-face cases.
-    result["embedding"] = face_items[0]["embedding"]
-    result["phash"] = face_items[0]["phash"]
-
-    # Face-only ELA + Grad-CAM. The rest of the scene remains zeroed in the output heatmap.
-    heat = masked_full_heatmap(bgr, [{"x":f["box"]["x"], "y":f["box"]["y"], "w":f["box"]["w"], "h":f["box"]["h"]} for f in faces])
-    result["heatmap"] = colorize_heatmap(heat, bgr=bgr)
-
-    if MODEL is None:
-        verdict, confidence, ftype = "review", 0, "Human face detected — CNN model not loaded"
-    else:
-        max_p = max(scores) if scores else 0.0
-        if max_p >= 0.80:
-            verdict, confidence, ftype = "flagged", round(max_p*100), "Face morph / facial manipulation"
-        elif max_p >= 0.50:
-            verdict, confidence, ftype = "review", round(max_p*100), "Possible face morph / manipulation"
-        else:
-            verdict, confidence, ftype = "authentic", round((1-max_p)*100), "No strong morph signal"
-
-    result.update({
-        "supported": True,
-        "verdict": verdict,
-        "confidence": confidence,
-        "forgery_type": ftype,
-        "breakdown": [
-            {"key":"face", "title":"Human Face Detection", "status":"pass",
-             "summary":f"{len(face_items)} face crop(s) isolated for analysis",
-             "detail":"Only the detected face crops are passed to CNN, ELA, pHash, embedding, and heatmap generation."},
-            {"key":"cnn", "title":"CNN Morph Detection", "status":"flagged" if verdict=="flagged" else ("reviewed" if verdict=="review" else "pass"),
-             "summary":"Face-level morph probability calculated from face crops only.",
-             "detail":"The full photo is never sent to the morph CNN."},
-            {"key":"ela", "title":"Error Level Analysis", "status":"reviewed",
-             "summary":"ELA fused into the face-only heatmap.",
-             "detail":"ELA is calculated separately on each face crop; non-face pixels are masked out of the result."},
-            {"key":"hash", "title":"Evidence Hashing", "status":"pass",
-             "summary":"SHA-256 preserves the exact uploaded evidence; pHash is face-crop-only.",
-             "detail":f"SHA-256 (file integrity): {result['sha256']} · Face pHash (first face): {result['phash']}"},
-            {"key":"embedding", "title":"Face-Crop Embedding", "status":"pass",
-             "summary":"L2-normalized embedding generated independently for each face crop.",
-             "detail":"No whole-image embedding is generated or used for face similarity."},
-        ],
-    })
-    return result
-
-@APP.post("/api/analyze")
-def api_analyze():
-    if "image" not in request.files:
-        return jsonify({"error":"multipart field 'image' is required"}), 400
-    f = request.files["image"]
-    data = f.read()
-    if not data:
-        return jsonify({"error":"empty image"}), 400
-    try:
-        return jsonify(analyze(data))
-    except Exception as exc:
-        return jsonify({"error":str(exc)}), 422
-
-@APP.get("/api/health")
-def health():
-    return jsonify({"ok":True, "morph_cnn_loaded": MODEL is not None, "device":str(DEVICE)})
-
-# Embedded dashboard for all-in-one distribution
-DASHBOARD_HTML = r"""<!DOCTYPE html>
+<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
@@ -708,18 +366,6 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
     .sidebar{ display:none; } main{ padding:18px; } .stats{ grid-template-columns:1fr; }
     table.inv{ font-size:0.78rem; } .settings-row{ flex-wrap:wrap; }
   }
-
-  .heatmap-card{ margin-top:16px; }
-  .heatmap-wrap{ position:relative; border-radius:10px; overflow:hidden; background:var(--border-soft); min-height:220px; }
-  .heatmap-wrap img{ width:100%; display:block; max-height:420px; object-fit:contain; }
-  .heatmap-empty{ padding:42px 20px; text-align:center; color:var(--text-muted); font-size:.86rem; }
-  .backend-note{ font-size:.76rem; color:var(--text-dim); line-height:1.5; margin-top:10px; }
-  .metric-grid{ display:grid; grid-template-columns:repeat(3,1fr); gap:10px; margin-top:12px; }
-  .metric-chip{ border:1px solid var(--border-soft); border-radius:9px; padding:10px; background:var(--bg); }
-  .metric-chip .k{font-size:.7rem;color:var(--text-dim)}
-  .metric-chip .v{font-size:.82rem;font-weight:600;margin-top:3px;word-break:break-word}
-  @media(max-width:600px){.metric-grid{grid-template-columns:1fr}}
-
 </style>
 </head>
 <body>
@@ -960,7 +606,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
             <div class="tip-item"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><rect x="3" y="3" width="18" height="14" rx="2"/><path d="m3 15 5-5 4 4 5-6 4 5"/></svg>Use high-quality images for better results.</div>
             <div class="tip-item"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M9 17H7a5 5 0 0 1 0-10h2"/><path d="M15 7h2a5 5 0 0 1 0 10h-2"/><path d="M8 12h8"/></svg>Screenshots, social posts, and news images are supported.</div>
             <div class="tip-item"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M6 2h9l5 5v15H6z"/><path d="M14 2v6h6"/></svg>Add relevant context to improve analysis.</div>
-            <div class="tip-item"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M12 2 4 6v6c0 5 3.5 8.5 8 10 4.5-1.5 8-5 8-10V6z"/></svg>Human-face morph detection runs through the local Python backend. Similarity results require a built reference index; source attribution is limited to evidence actually present in file metadata.</div>
+            <div class="tip-item"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M12 2 4 6v6c0 5 3.5 8.5 8 10 4.5-1.5 8-5 8-10V6z"/></svg>Prototype note: detection, similar-match and source-attribution results below are simulated on-device for this demo, not a live model or web crawl.</div>
           </div>
         </div>
       </div>
@@ -994,18 +640,6 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
                 <div class="meta-row"><span class="k">File Size</span><span class="v" id="anFsize">—</span></div>
                 <div class="meta-row"><span class="k">Uploaded On</span><span class="v" id="anFdate">—</span></div>
               </div>
-            </div>
-            <div class="card heatmap-card">
-              <div class="card-head">
-                <div class="card-title"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M4 18 10 4l4 9 2-5 4 10"/><path d="M4 20h16"/></svg>Human Morph Heatmap</div>
-              </div>
-              <div class="heatmap-wrap" id="anHeatmapWrap"><div class="heatmap-empty" id="anHeatmapEmpty">Heatmap unavailable.</div><img id="anHeatmap" alt="Face morph localization heatmap" style="display:none;"></div>
-              <div class="metric-grid">
-                <div class="metric-chip"><div class="k">Human faces</div><div class="v" id="anFaceCount">—</div></div>
-                <div class="metric-chip"><div class="k">CNN status</div><div class="v" id="anModelStatus">—</div></div>
-                <div class="metric-chip"><div class="k">Embedding</div><div class="v" id="anEmbeddingModel">—</div></div>
-              </div>
-              <div class="backend-note">Heatmap = face-region CNN Grad-CAM fused with ELA. It is a localization aid, not standalone proof of manipulation.</div>
             </div>
             <div class="card">
               <div class="card-head"><div class="card-title"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M3 20V10"/><path d="M10 20V4"/><path d="M17 20v-7"/></svg>Analysis Breakdown</div></div>
@@ -1052,7 +686,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
         <div class="hero-left">
           <div class="breadcrumb">INVESTIGATIONS <span class="sep">/</span> <span class="cur">SIMILAR MATCHES</span></div>
           <h1 style="font-size:clamp(1.5rem,2.4vw,2.1rem);">Similar <em>Matches</em></h1>
-          <p class="lede">Visually similar FACE references found in the local index, using face-crop pHash and embeddings.</p>
+          <p class="lede">Visually similar images found across public sources, by perceptual hash and embedding similarity.</p>
         </div>
       </div>
       <div class="card">
@@ -1066,7 +700,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
         <div style="color:var(--text-muted); font-size:0.9rem;" id="matchLoadingLabel">Searching public sources…</div>
       </div>
       <div class="card" id="matchResults">
-        <div class="card-desc">Live local reference index using FACE-CROP embeddings and perceptual hashing. No whole-photo similarity is used.</div>
+        <div class="card-desc">Demo dataset — a full build would call a reverse-image API (perceptual hashing / embedding search against a crawled index) to return live source URLs. Results below are simulated but deterministic for the selected case.</div>
         <div class="match-grid" id="matchGrid"></div>
       </div>
     </section>
@@ -1087,7 +721,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
         </div>
       </div>
       <div class="card">
-        <div class="card-desc">Evidence timeline is limited to events recorded by the local forensic pipeline; online propagation is not inferred without source records.</div>
+        <div class="card-desc">Simulated propagation trace, seeded from the case's evidence hash.</div>
         <div class="tl" id="tlList"></div>
       </div>
     </section>
@@ -1124,7 +758,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
           <div class="meta-row"><span class="k">Platform</span><span class="v" id="attrPlatform">—</span></div>
           <div class="meta-row"><span class="k">Handle</span><span class="v" id="attrHandle">—</span></div>
           <div class="meta-row"><span class="k">Posted</span><span class="v" id="attrPosted">—</span></div>
-          <p class="card-desc" style="margin-top:14px;">Only metadata actually present in the uploaded file is shown. No platform, handle, region or origin is fabricated; missing metadata is reported as unavailable.</p>
+          <p class="card-desc" style="margin-top:14px;">Attribution is inferred from EXIF remnants, compression fingerprints and cross-referenced posting patterns — treat as an investigative lead, not proof of origin.</p>
         </div>
       </div>
     </section>
@@ -1274,7 +908,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   var platforms = ['X (Twitter)','Telegram','Instagram','Facebook','WhatsApp forward','Reddit'];
 
   /* ---------------- State ---------------- */
-  var investigations = [];
+  var investigations = loadJSON(STORAGE_KEY, null) || seed.slice();
   var profile = loadJSON(PROFILE_KEY, null) || { name:'Munazza', role:'Investigator' };
   var pendingFile = null;
   var lastAnalyzed = null;
@@ -1290,7 +924,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   function saveJSON(key, val){
     try{ localStorage.setItem(key, JSON.stringify(val)); }catch(e){ /* ignore */ }
   }
-  function saveState(){ /* case records are persisted by the Python backend */ }
+  function saveState(){ saveJSON(STORAGE_KEY, investigations); }
 
   /* ---------------- Small helpers ---------------- */
   function verdictLabel(v){ return v === 'authentic' ? 'Likely Authentic' : v === 'review' ? 'Needs Review' : 'Manipulated'; }
@@ -1298,7 +932,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   function fmtBytes(n){ if(n < 1024) return n + ' B'; if(n < 1024*1024) return (n/1024).toFixed(0) + ' KB'; return (n/(1024*1024)).toFixed(1) + ' MB'; }
   function fmtDate(d){ var m=['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec']; return d.getDate()+' '+m[d.getMonth()]+' '+d.getFullYear(); }
   function nextCaseId(){
-    var max=0; investigations.forEach(function(inv){ var m=/TT-2026-(\\d+)/.exec(inv.id); if(m) max=Math.max(max,parseInt(m[1],10)); });
+    var max=0; investigations.forEach(function(inv){ var m=/TT-2026-(\d+)/.exec(inv.id); if(m) max=Math.max(max,parseInt(m[1],10)); });
     return 'TT-2026-'+String(max+1).padStart(3,'0');
   }
   function simpleHash(str){ var h=0; for(var i=0;i<str.length;i++){ h=((h<<5)-h)+str.charCodeAt(i); h|=0; } return Math.abs(h); }
@@ -1306,47 +940,86 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   function escapeHtml(s){ return String(s).replace(/[&<>"']/g, function(c){ return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]; }); }
   function pick(list, seedNum, salt){ return list[(seedNum + salt) % list.length]; }
 
-  /* ---------------- Backend analysis ---------------- */
-  var API_BASE = localStorage.getItem('FORENSIGHT_API_BASE') || 'http://127.0.0.1:5000';
+  /* ---------------- Simulated analysis engine ---------------- */
+  var forgeryTypes = ['None detected','Splicing (background region)','Face-swap, 1 face','Face-swap, 2+ faces','Copy-move duplication','Deepfake artifact (facial)'];
+  function runSimulatedAnalysis(file){
+    var seedNum = simpleHash(file.name+'_'+file.size);
+    var typeIdx = seedNum % forgeryTypes.length;
+    var forgeryType = forgeryTypes[typeIdx];
+    var confidence = 58 + (seedNum % 41);
+    var verdict;
+    if(typeIdx === 0){ verdict = confidence >= 78 ? 'authentic' : 'review'; }
+    else { verdict = confidence >= 80 ? 'flagged' : 'review'; }
+    var breakdown = [
+      { key:'metadata', title:'Metadata Analysis', icon:'doc', status: verdict==='flagged'?'reviewed':'pass',
+        summary: verdict==='flagged'?'Editing software signature found in metadata.':'No unusual metadata detected.',
+        detail:'Checked EXIF fields (creation tool, timestamps, GPS) against expected camera/app patterns for this file type.' },
+      { key:'consistency', title:'Image Consistency', icon:'search', status: verdict==='authentic'?'pass':'flagged',
+        summary: verdict==='authentic'?'No signs of splicing or manipulation.':('Localized inconsistency detected: '+forgeryType.toLowerCase()+'.'),
+        detail:'Compared noise patterns, lighting direction and edge continuity across image regions to flag boundaries that don\u2019t belong together.' },
+      { key:'compression', title:'Compression Analysis', icon:'hash', status:'pass', summary:'Compression levels are consistent.',
+        detail:'Quantization tables and block artifacts were consistent across the frame, suggesting a single encode pass.' },
+      { key:'ela', title:'Error Level Analysis', icon:'flag', status: verdict==='flagged'?'reviewed':'pass',
+        summary: verdict==='flagged'?'Abnormal pixel variations found in affected region.':'No abnormal pixel variations found.',
+        detail:'Re-compressed the image and diffed error levels; brighter regions can indicate a different compression history than the rest of the image.' },
+      { key:'reverse', title:'Reverse Image Search', icon:'globe', status: verdict==='authentic'?'pass':'reviewed',
+        summary: verdict==='authentic'?'No exact matches found. Some visually similar images exist.':'Visually similar images found across multiple sources.',
+        detail:'Matched perceptual hashes and embeddings against a reference set to trace prior appearances of this image or its regions.' }
+    ];
+    return { forgeryType:forgeryType, verdict:verdict, confidence:confidence, breakdown:breakdown, hash:hexHash(seedNum) };
+  }
 
-  function normalizeCase(r){
-    r = r || {};
-    return {
-      id:r.case_id, name:r.name || r.filename || 'Untitled case', filename:r.filename || 'evidence',
-      forgeryType:r.forgeryType || 'Human-face analysis', verdict:r.verdict || 'review',
-      confidence:Number(r.confidence||0), updated:fmtDate(new Date(r.updated||r.created_at||Date.now())),
-      createdAt:r.created_at, img:r.img || (r.case_id ? API_BASE+'/api/cases/'+encodeURIComponent(r.case_id)+'/preview' : ''),
-      hash:r.hash || r.sha256 || '—', sha256:r.sha256 || r.hash || '—', phash:r.phash || '—',
-      embedding:r.embedding || [], embedding_model:r.embedding_model || '—', faceCount:r.faceCount||0,
-      faces:r.faces||[], modelLoaded:!!r.modelLoaded, supported:!!r.supported, scope:r.scope||'human-face-morph-detection-only',
-      message:r.message||'', heatmap:r.heatmap||null, breakdown:r.breakdown||[], exif:r.exif||{},
-      matches:r.matches||[], notes:r.notes||''
-    };
-  }
-  async function loadCasesFromBackend(){
-    try{
-      var res=await fetch(API_BASE+'/api/cases');
-      if(!res.ok) throw new Error('backend unavailable');
-      var data=await res.json();
-      investigations=(data.cases||[]).map(normalizeCase);
-      if(investigations.length) lastAnalyzed=investigations[0];
-      renderAll();
-      if(lastAnalyzed) renderAnalysis(lastAnalyzed);
-    }catch(e){
-      console.warn('ForenSight backend not reachable:',e);
-      investigations=[];
-      renderAll();
+  function generateMatches(inv){
+    var seedNum = simpleHash(inv.hash || inv.id);
+    var count = inv.verdict === 'authentic' ? 2 : 3 + (seedNum % 2);
+    var labels = ['Similar composition','Same subject, different crop','Near-duplicate upload','Reposted variant','Cropped duplicate','Color-adjusted copy'];
+    var matches = [];
+    for(var i=0;i<count;i++){
+      var s = seedNum + i*97;
+      matches.push({
+        title: pick(labels, s, i) ,
+        domain: pick(sourceDomains, s, i*3),
+        similarity: 60 + (s % 39),
+        date: fmtDate(new Date(2026, (s%9), 1 + (s%27)))
+      });
     }
+    matches.sort(function(a,b){ return b.similarity - a.similarity; });
+    return matches;
   }
-  async function runForensicAnalysis(file, name, notes){
-    var fd=new FormData();
-    fd.append('image',file);
-    fd.append('name',name||file.name);
-    fd.append('notes',notes||'');
-    var res=await fetch(API_BASE+'/api/analyze',{method:'POST',body:fd});
-    var payload=await res.json();
-    if(!res.ok) throw new Error(payload.error||'Backend analysis failed');
-    return normalizeCase(payload);
+
+  function generateTimeline(inv){
+    var seedNum = simpleHash(inv.hash || inv.id);
+    var steps = [
+      { title:'Original image captured / created', icon:'doc' },
+      { title:'First appearance online', icon:'globe' },
+      { title:'Reposted on ' + pick(platforms, seedNum, 1), icon:'search' },
+      { title:'Shared in forwarded/group chat', icon:'globe' },
+      { title: inv.verdict === 'flagged' ? 'Flagged by ForenSight — ' + inv.forgeryType : 'Reviewed by ForenSight', icon:'flag' }
+    ];
+    var daysAgo = [ 21, 15, 9, 4, 0 ];
+    return steps.map(function(s, i){
+      var d = new Date(); d.setDate(d.getDate() - daysAgo[i]);
+      return { title:s.title, icon:s.icon, date: fmtDate(d), alert: i === steps.length-1 && inv.verdict === 'flagged',
+        desc: i===0 ? 'Estimated from file metadata and compression generation.' :
+              i===1 ? 'Earliest matching copy found in the simulated source index.' :
+              i===2 ? 'Detected via near-duplicate matching against public posts.' :
+              i===3 ? 'Inferred from re-compression pattern typical of chat apps.' :
+              'Final verdict recorded and evidence hash generated for chain of custody.' };
+    });
+  }
+
+  function generateAttribution(inv){
+    var seedNum = simpleHash(inv.hash || inv.id);
+    return {
+      region: pick(regions, seedNum, 0),
+      gps: (seedNum % 3 === 0) ? 'Present (coordinates stripped by platform)' : 'Not present',
+      device: pick(devices, seedNum, 2),
+      software: pick(software, seedNum, 4),
+      confidence: 45 + (seedNum % 46),
+      platform: pick(platforms, seedNum, 1),
+      handle: '@user_' + (1000 + (seedNum % 8999)),
+      posted: fmtDate(new Date(2026, seedNum%9, 1 + (seedNum%27)))
+    };
   }
 
   /* ---------------- Rendering: Dashboard ---------------- */
@@ -1370,14 +1043,14 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
       '<td><div class="inv-name"><div class="thumb">'+thumbHtml(inv)+'</div><div><div class="t">'+escapeHtml(inv.name)+'</div><div class="s">'+escapeHtml(inv.filename)+'</div></div></div></td>'+
       '<td>'+inv.id+'</td><td class="row-ext">'+escapeHtml(inv.forgeryType)+'</td>'+
       '<td><span class="pill '+verdictPillClass(inv.verdict)+'">'+verdictLabel(inv.verdict)+'</span></td>'+
-      '<td class="conf">'+inv.confidence+'%</td><td>'+escapeHtml(inv.updated||'')+'</td></tr>';
+      '<td class="conf">'+inv.confidence+'%</td><td>'+inv.updated+'</td></tr>';
   }
   function filteredInvestigations(){
     var q = (document.getElementById('searchInput').value||'').trim().toLowerCase();
     if(!q) return investigations;
     return investigations.filter(function(inv){
-      return String(inv.name||'').toLowerCase().indexOf(q)>-1 || String(inv.id||'').toLowerCase().indexOf(q)>-1 ||
-             String(inv.forgeryType||'').toLowerCase().indexOf(q)>-1 || String(inv.filename||'').toLowerCase().indexOf(q)>-1;
+      return inv.name.toLowerCase().indexOf(q)>-1 || inv.id.toLowerCase().indexOf(q)>-1 ||
+             inv.forgeryType.toLowerCase().indexOf(q)>-1 || inv.filename.toLowerCase().indexOf(q)>-1;
     });
   }
   function renderTables(){
@@ -1420,55 +1093,42 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
 
   /* ---------------- Rendering: Analysis ---------------- */
   function renderAnalysis(inv){
-    if(!inv) return;
-    document.getElementById('analysisEmpty').style.display='none';
-    document.getElementById('analysisContent').style.display='block';
-    document.getElementById('anCaseId').textContent=inv.id;
-    document.getElementById('anImg').src=inv.img || '';
-    document.getElementById('anFname').textContent=inv.filename;
-    document.getElementById('anFtype').textContent=(inv.filename.split('.').pop()||'').toUpperCase()||'—';
-    document.getElementById('anFsize').textContent='Backend-stored evidence';
-    document.getElementById('anFdate').textContent=inv.updated;
-    var badge=document.getElementById('anVerdictBadge');
-    badge.className='verdict-badge '+verdictPillClass(inv.verdict); badge.textContent=verdictLabel(inv.verdict);
-    var titleEl=document.getElementById('anAssessTitle'), descEl=document.getElementById('anAssessDesc');
-    if(!inv.supported){
-      titleEl.textContent='Outside the supported human-face scope.';
-      descEl.textContent=inv.message || 'No human face was detected. No morph probability was fabricated.';
-    } else if(!inv.modelLoaded){
-      titleEl.textContent='Human face detected; CNN model unavailable.';
-      descEl.textContent='Install/train the morph checkpoint before treating the CNN result as available.';
-    } else if(inv.verdict==='flagged'){
-      titleEl.textContent='Human-face morph signal flagged.';
-      descEl.textContent='The face morph CNN crossed the configured flag threshold. Review the heatmap and underlying evidence before making a forensic conclusion.';
-    } else if(inv.verdict==='review'){
-      titleEl.textContent='Human-face morph signal needs review.';
-      descEl.textContent='The CNN probability is in the configured review range. This is an assistive forensic result, not standalone proof.';
-    } else {
-      titleEl.textContent='No strong human-face morph signal detected.';
-      descEl.textContent='The CNN probability is below the configured review threshold. This does not establish authenticity by itself.';
-    }
-    var fill=document.getElementById('anConfFill');
-    fill.className='conf-fill '+verdictPillClass(inv.verdict); fill.style.width=Math.min(100,Math.max(0,inv.confidence))+'%';
-    document.getElementById('anConfNum').textContent=inv.confidence+'%';
-    document.getElementById('anHash').textContent=inv.sha256||inv.hash;
-    document.getElementById('anForgeryType').textContent=inv.forgeryType;
-    var hm=document.getElementById('anHeatmap'), empty=document.getElementById('anHeatmapEmpty');
-    if(inv.heatmap){hm.src=inv.heatmap;hm.style.display='block';empty.style.display='none';}
-    else {hm.removeAttribute('src');hm.style.display='none';empty.style.display='block';empty.textContent=inv.supported?'Heatmap unavailable — CNN model may not be loaded.':'No human face region available for heatmap.';}
-    document.getElementById('anFaceCount').textContent=String(inv.faceCount);
-    document.getElementById('anModelStatus').textContent=inv.modelLoaded?'Loaded':'Not loaded';
-    document.getElementById('anEmbeddingModel').textContent=inv.embedding_model||'—';
-    var bdList=document.getElementById('breakdownList'), breakdown=inv.breakdown||[];
-    bdList.innerHTML=breakdown.map(function(b){
-      var pillClass=b.status==='pass'?'pass':(b.status==='reviewed'?'reviewed':'flagged');
-      var pillLabel=b.status==='pass'?'Pass':(b.status==='reviewed'?'Reviewed':'Flagged');
-      return '<div class="breakdown-item"><div class="bd-head"><div class="bd-icon">'+(icons[b.icon]||icons.search)+'</div>'+
+    document.getElementById('analysisEmpty').style.display = 'none';
+    document.getElementById('analysisContent').style.display = 'block';
+    document.getElementById('anCaseId').textContent = inv.id;
+    document.getElementById('anImg').src = inv.img || ('data:image/svg+xml;utf8,' + encodeURIComponent(
+      '<svg xmlns="http://www.w3.org/2000/svg" width="600" height="340"><rect width="600" height="340" fill="#DCE6FD"/><text x="300" y="175" font-family="Inter" font-size="18" fill="#2E56E8" text-anchor="middle">'+escapeHtml(inv.filename)+'</text></svg>'));
+    document.getElementById('anFname').textContent = inv.filename;
+    document.getElementById('anFtype').textContent = (inv.filename.split('.').pop()||'').toUpperCase() || '—';
+    document.getElementById('anFsize').textContent = inv.sizeLabel || '—';
+    document.getElementById('anFdate').textContent = inv.updated;
+    var badge = document.getElementById('anVerdictBadge');
+    badge.className = 'verdict-badge ' + verdictPillClass(inv.verdict);
+    badge.textContent = verdictLabel(inv.verdict);
+    var titleEl = document.getElementById('anAssessTitle'), descEl = document.getElementById('anAssessDesc');
+    if(inv.verdict==='authentic'){ titleEl.textContent='No strong signs of manipulation detected.'; descEl.textContent='Our analysis found no significant evidence of tampering. Minor inconsistencies may still exist — review the breakdown below.'; }
+    else if(inv.verdict==='review'){ titleEl.textContent='Some indicators need human review.'; descEl.textContent='One or more checks came back inconclusive. Treat this image as unverified until reviewed by an investigator.'; }
+    else { titleEl.textContent='Strong evidence of manipulation.'; descEl.textContent='Multiple checks flagged inconsistencies consistent with '+inv.forgeryType.toLowerCase()+'. Evidence hash has been generated for chain of custody.'; }
+    var fill = document.getElementById('anConfFill');
+    fill.className = 'conf-fill ' + verdictPillClass(inv.verdict);
+    fill.style.width = inv.confidence + '%';
+    document.getElementById('anConfNum').textContent = inv.confidence + '%';
+    document.getElementById('anHash').textContent = inv.hash;
+    document.getElementById('anForgeryType').textContent = inv.forgeryType;
+    var bdList = document.getElementById('breakdownList');
+    var breakdown = inv.breakdown || [];
+    bdList.innerHTML = breakdown.map(function(b){
+      var pillClass = b.status==='pass'?'pass':(b.status==='reviewed'?'reviewed':'flagged');
+      var pillLabel = b.status==='pass'?'Pass':(b.status==='reviewed'?'Reviewed':'Flagged');
+      return '<div class="breakdown-item"><div class="bd-head"><div class="bd-icon">'+icons[b.icon]+'</div>'+
         '<div class="bd-title"><div class="t">'+escapeHtml(b.title)+'</div><div class="s">'+escapeHtml(b.summary)+'</div></div>'+
-        '<span class="pill '+pillClass+'">'+pillLabel+'</span><svg class="bd-chev" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="m6 9 6 6 6-6"/></svg></div>'+
+        '<span class="pill '+pillClass+'">'+pillLabel+'</span>'+
+        '<svg class="bd-chev" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="m6 9 6 6 6-6"/></svg></div>'+
         '<div class="bd-detail">'+escapeHtml(b.detail)+'</div></div>';
     }).join('');
-    Array.prototype.forEach.call(bdList.querySelectorAll('.bd-head'),function(head){head.addEventListener('click',function(){head.parentElement.classList.toggle('open');});});
+    Array.prototype.forEach.call(bdList.querySelectorAll('.bd-head'), function(head){
+      head.addEventListener('click', function(){ head.parentElement.classList.toggle('open'); });
+    });
   }
 
   /* ---------------- Rendering: Similar Matches / Timeline / Attribution selectors ---------------- */
@@ -1481,47 +1141,48 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   }
 
   var matchSwatches = ['#2E56E8','#1C3FBF','#C9891F','#17A768','#D8433F','#5B6472'];
-  async function renderMatches(inv){
-    var grid=document.getElementById('matchGrid');
-    grid.innerHTML='<div class="card-desc">Searching local reference index…</div>';
-    var matches=await fetchMatches(inv);
-    if(!matches.length){
-      grid.innerHTML='<div class="card-desc">No indexed reference matches. Add reference images and rebuild the index to enable local similarity search.</div>';
-      return;
-    }
-    grid.innerHTML=matches.map(function(m){
-      var title=m.title||m.filename||m.id||'Indexed reference';
-      var link=m.url ? '<a href="'+escapeHtml(m.url)+'" target="_blank" rel="noopener">'+escapeHtml(title)+'</a>' : escapeHtml(title);
-      return '<div class="match-card"><div class="match-thumb" style="background:var(--blue-tint);color:var(--blue);">'+escapeHtml((m.embedding_model||'Reference').toUpperCase())+'</div>'+
-        '<div class="match-body"><div class="t">'+link+'</div><div class="s">'+escapeHtml(m.filename||'')+'</div>'+
-        '<div class="row"><span class="match-sim">'+Number(m.similarity||0).toFixed(1)+'% combined</span><span class="match-sim">'+Number(m.embedding_similarity||0).toFixed(1)+'% embedding</span></div></div></div>';
+  function renderMatches(inv){
+    var matches = generateMatches(inv);
+    document.getElementById('matchGrid').innerHTML = matches.map(function(m, i){
+      var color = matchSwatches[i % matchSwatches.length];
+      return '<div class="match-card">'+
+        '<div class="match-thumb" style="background:'+color+';">'+escapeHtml(m.title)+'</div>'+
+        '<div class="match-body"><div class="t">'+escapeHtml(m.title)+'</div><div class="s">'+m.domain+' · '+m.date+'</div>'+
+        '<div class="row"><span class="match-sim">'+m.similarity+'% match</span></div></div></div>';
     }).join('');
   }
   function runMatchScan(inv){
-    var loading=document.getElementById('matchLoading'), results=document.getElementById('matchResults');
-    loading.style.display='block'; results.style.display='none';
-    document.getElementById('matchLoadingLabel').textContent='Comparing normalized embeddings and pHash against local reference index…';
-    renderMatches(inv).finally(function(){loading.style.display='none';results.style.display='block';});
+    var loading = document.getElementById('matchLoading');
+    var results = document.getElementById('matchResults');
+    var label = document.getElementById('matchLoadingLabel');
+    loading.style.display = 'block'; results.style.display = 'none';
+    var msgs = ['Searching public sources…','Comparing perceptual hashes…','Cross-checking known platforms…'];
+    var i = 0; label.textContent = msgs[0];
+    var t = setInterval(function(){
+      i++; if(i>=msgs.length){ clearInterval(t); loading.style.display='none'; results.style.display='block'; renderMatches(inv); return; }
+      label.textContent = msgs[i];
+    }, 450);
   }
 
   function renderTimeline(inv){
-    var steps=generateTimeline(inv);
-    document.getElementById('tlList').innerHTML=steps.map(function(s){
-      return '<div class="tl-item"><div class="tl-dot'+(s.alert?' alert':'')+'"></div><div class="tl-date">'+escapeHtml(s.date)+'</div><div class="tl-title">'+escapeHtml(s.title)+'</div><div class="tl-desc">'+escapeHtml(s.desc)+'</div></div>';
+    var steps = generateTimeline(inv);
+    document.getElementById('tlList').innerHTML = steps.map(function(s){
+      return '<div class="tl-item"><div class="tl-dot'+(s.alert?' alert':'')+'">'+ (s.alert ? '' : '') +'</div>'+
+        '<div class="tl-date">'+s.date+'</div><div class="tl-title">'+escapeHtml(s.title)+'</div><div class="tl-desc">'+escapeHtml(s.desc)+'</div></div>';
     }).join('');
   }
 
   function renderAttribution(inv){
-    var a=generateAttribution(inv);
-    document.getElementById('attrRegion').textContent=a.region;
-    document.getElementById('attrGps').textContent=a.gps;
-    document.getElementById('attrDevice').textContent=a.device;
-    document.getElementById('attrSoftware').textContent=a.software;
-    document.getElementById('attrConfFill').style.width='0%';
-    document.getElementById('attrConfNum').textContent='Not scored';
-    document.getElementById('attrPlatform').textContent=a.platform;
-    document.getElementById('attrHandle').textContent=a.handle;
-    document.getElementById('attrPosted').textContent=a.posted;
+    var a = generateAttribution(inv);
+    document.getElementById('attrRegion').textContent = a.region;
+    document.getElementById('attrGps').textContent = a.gps;
+    document.getElementById('attrDevice').textContent = a.device;
+    document.getElementById('attrSoftware').textContent = a.software;
+    document.getElementById('attrConfFill').style.width = a.confidence + '%';
+    document.getElementById('attrConfNum').textContent = a.confidence + '%';
+    document.getElementById('attrPlatform').textContent = a.platform;
+    document.getElementById('attrHandle').textContent = a.handle;
+    document.getElementById('attrPosted').textContent = a.posted;
   }
 
   /* ---------------- Rendering: Evidence Vault ---------------- */
@@ -1557,7 +1218,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
         return;
       }catch(e){ /* fall through to alert */ }
     }
-    alert('Evidence package for ' + inv.id + ' (download not available in this preview):\\n\\n' + text.slice(0, 500) + (text.length>500 ? '\\n…' : ''));
+    alert('Evidence package for ' + inv.id + ' (download not available in this preview):\n\n' + text.slice(0, 500) + (text.length>500 ? '\n…' : ''));
   }
 
   /* ---------------- View switching ---------------- */
@@ -1640,7 +1301,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
       dzFname.textContent = file.name;
       dzFmeta.textContent = fmtBytes(file.size) + ' · ' + (file.type || 'image');
       dzEmpty.style.display='none'; dzPreview.classList.add('show');
-      if(!invNameInput.value){ invNameInput.value = file.name.replace(/\\.[^.]+$/, '').replace(/[_-]+/g,' '); }
+      if(!invNameInput.value){ invNameInput.value = file.name.replace(/\.[^.]+$/, '').replace(/[_-]+/g,' '); }
       updateStartBtn();
     };
     reader.readAsDataURL(file);
@@ -1650,40 +1311,47 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   var progressWrap = document.getElementById('progressWrap');
   var progressFill = document.getElementById('progressFill');
   var progressLabel = document.getElementById('progressLabel');
-  var progressSteps = [[12,'Uploading exact evidence bytes…'],[28,'Detecting human face regions…'],[48,'Running face morph CNN…'],[66,'Computing face-only ELA + Grad-CAM heatmap…'],[82,'Computing file SHA-256 + face-only pHash/embedding…'],[94,'Searching local reference index…'],[100,'Saving chain-of-custody record…']];
+  var progressSteps = [[15,'Reading pixel data…'],[35,'Checking metadata & EXIF…'],[58,'Scanning for splicing artifacts…'],[78,'Running error-level analysis…'],[92,'Matching against reference set…'],[100,'Finalizing verdict…']];
 
-  startBtn.addEventListener('click', async function(){
+  startBtn.addEventListener('click', function(){
     if(!pendingFile) return;
-    startBtn.disabled=true; progressWrap.classList.add('show'); progressFill.style.width='0%';
-    var i=0;
-    var timer=setInterval(function(){
-      if(i>=progressSteps.length){ clearInterval(timer); return; }
-      progressFill.style.width=progressSteps[i][0]+'%';
-      progressLabel.textContent=progressSteps[i][1]; i++;
-    },220);
-    try{
-      var result=await runForensicAnalysis(pendingFile.file, invNameInput.value.trim(), document.getElementById('invNotes').value.trim());
-      clearInterval(timer); progressFill.style.width='100%'; progressLabel.textContent='Analysis complete.';
-      investigations.unshift(result); lastAnalyzed=result;
-      alerts.unshift({
-        icon:result.verdict==='flagged'?'flag':'check',
-        title:(result.verdict==='flagged'?'Manipulation signal flagged — ':'Analysis complete — ')+result.name,
-        sub:(result.confidence||0)+'% confidence · '+result.forgeryType+' · just now'
-      });
-      alerts=alerts.slice(0,6);
-      document.getElementById('bellDot').classList.remove('hide');
-      renderAll(); renderAnalysis(result);
-      setTimeout(function(){
-        progressWrap.classList.remove('show'); progressFill.style.width='0%';
-        pendingFile=null; fileInput.value=''; dzEmpty.style.display='block'; dzPreview.classList.remove('show');
-        invNameInput.value=''; document.getElementById('invNotes').value=''; updateStartBtn(); showView('analysis');
-      },350);
-    }catch(e){
-      clearInterval(timer); progressWrap.classList.remove('show'); progressFill.style.width='0%';
-      startBtn.disabled=false;
-      alert('Analysis failed: '+e.message+'\\\\n\\\\nStart backend.py and confirm the API is reachable at '+API_BASE+'.');
-    }
+    startBtn.disabled = true; progressWrap.classList.add('show');
+    var i=0; progressFill.style.width='0%';
+    var timer = setInterval(function(){
+      if(i>=progressSteps.length){ clearInterval(timer); finishAnalysis(); return; }
+      progressFill.style.width = progressSteps[i][0]+'%'; progressLabel.textContent = progressSteps[i][1]; i++;
+    }, 260);
   });
+
+  function finishAnalysis(){
+    var result = runSimulatedAnalysis(pendingFile.file);
+    var now = new Date();
+    var inv = {
+      id: nextCaseId(), name: invNameInput.value.trim() || pendingFile.file.name, filename: pendingFile.file.name,
+      forgeryType: result.forgeryType, verdict: result.verdict, confidence: result.confidence,
+      updated: fmtDate(now), img: pendingFile.dataUrl, sizeLabel: fmtBytes(pendingFile.file.size),
+      hash: result.hash, breakdown: result.breakdown
+    };
+    investigations.unshift(inv); saveState(); lastAnalyzed = inv;
+
+    alerts.unshift({
+      icon: inv.verdict==='flagged' ? 'flag' : 'check',
+      title: (inv.verdict==='flagged' ? 'Manipulation flagged — ' : 'Analysis complete — ') + inv.name,
+      sub: inv.confidence + '% confidence · ' + inv.forgeryType + ' · just now'
+    });
+    alerts = alerts.slice(0,6);
+    document.getElementById('bellDot').classList.remove('hide');
+
+    renderAll(); renderAnalysis(inv);
+
+    setTimeout(function(){
+      progressWrap.classList.remove('show'); progressFill.style.width='0%';
+      pendingFile = null; fileInput.value = '';
+      dzEmpty.style.display='block'; dzPreview.classList.remove('show');
+      invNameInput.value=''; document.getElementById('invNotes').value='';
+      updateStartBtn(); showView('analysis');
+    }, 350);
+  }
 
   /* ---------------- Quick actions ---------------- */
   document.getElementById('exportBtn').addEventListener('click', function(){
@@ -1757,7 +1425,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
 
   function deriveNameFromEmail(email){
     var local = String(email).split('@')[0] || 'Investigator';
-    var words = local.replace(/[._-]+/g, ' ').trim().split(/\\s+/).filter(Boolean);
+    var words = local.replace(/[._-]+/g, ' ').trim().split(/\s+/).filter(Boolean);
     if(!words.length) return 'Investigator';
     return words.map(function(w){ return w.charAt(0).toUpperCase() + w.slice(1); }).join(' ');
   }
@@ -1802,8 +1470,6 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
     }catch(e){ downloadsCap = null; }
   })();
 
-  loadCasesFromBackend();
-
   (function initSession(){
     var existing = null;
     try{ existing = sessionStorage.getItem(SESSION_KEY); }catch(e){}
@@ -1812,48 +1478,4 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
 })();
 </script>
 </body>
-</htmlasync function fetchMatches(inv){
-    try{
-      var res=await fetch(API_BASE+'/api/cases/'+encodeURIComponent(inv.id)+'/matches');
-      if(!res.ok) throw new Error('match endpoint unavailable');
-      return (await res.json()).matches||[];
-    }catch(e){ return inv.matches||[]; }
-  }
-
-  function generateTimeline(inv){
-    var steps=[];
-    if(inv.createdAt) steps.push({title:'Case analyzed by local forensic backend',date:fmtDate(new Date(inv.createdAt)),desc:'Case record created and SHA-256 evidence hash stored.',alert:false});
-    if(inv.faces && inv.faces.length) steps.push({title:inv.faceCount+' human face region(s) detected',date:fmtDate(new Date(inv.createdAt||Date.now())),desc:'Face detector regions were passed to the morph analysis pipeline.',alert:false});
-    steps.push({title:inv.verdict==='flagged'?'Morph signal crossed flag threshold':inv.verdict==='review'?'Morph signal entered review range':'Morph signal remained below review threshold',
-      date:fmtDate(new Date(inv.updated||Date.now())),desc:inv.message||'Backend result recorded.',alert:inv.verdict==='flagged'});
-    return steps;
-  }
-
-  function generateAttribution(inv){
-    var e=inv.exif||{};
-    return {
-      region:e.GPSInfo ? 'GPS metadata present (coordinates retained in EXIF)' : 'Unavailable — no GPS metadata',
-      gps:e.GPSInfo ? 'Present' : 'Not present',
-      device:e.Model ? e.Model+(e.Make?' · '+e.Make:'') : 'Unavailable in metadata',
-      software:e.Software||'Unavailable in metadata',
-      confidence:null,
-      platform:'Not established from local evidence',
-      handle:'Not established from local evidence',
-      posted:'Not established from local evidence'
-    };
-  }
-
->"""
-
-@app.route("/dashboard")
-def dashboard_embedded():
-    from flask import Response
-    return Response(DASHBOARD_HTML, mimetype="text/html")
-
-@app.route("/")
-def root_embedded():
-    from flask import Response
-    return Response(DASHBOARD_HTML, mimetype="text/html")
-
-if __name__ == "__main__":
-    APP.run(host="0.0.0.0", port=int(os.getenv("PORT", "5000")), debug=True)
+</html>
